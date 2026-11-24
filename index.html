@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Liquid Soccer</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#07131f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<style>
+  /* Layout: full-bleed game canvas; overlays are centered cards; a tiny sync pill floats top-left. */
+  :root {
+    --bg: #07131f;
+    --card: #0e2133;
+    --line: #1f3a52;
+    --fg: #e8f1f8;
+    --muted: #8ba6bd;
+    --accent: #22d3a6;
+    --warn: #f5b84b;
+    --err: #ff6b6b;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color-scheme: dark;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); font: 15px/1.5 var(--font); }
+  #canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; outline: none; touch-action: none; }
+  [hidden] { display: none !important; }
+
+  .overlay { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg); z-index: 20;
+    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+  .overlay.dim { background: color-mix(in srgb, var(--bg) 82%, transparent); backdrop-filter: blur(4px); }
+  .card { width: min(440px, 100%); background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 24px; display: grid; gap: 14px; box-sizing: border-box; }
+  .card h1 { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.01em; text-wrap: balance; }
+  .card p { margin: 0; color: var(--muted); }
+  .card ol { margin: 0; padding-left: 20px; color: var(--muted); display: grid; gap: 6px; }
+  .card b { color: var(--fg); }
+  a { color: var(--accent); }
+  input { width: 100%; box-sizing: border-box; padding: 11px 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  button { font: 600 14px var(--font); padding: 10px 14px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #04211a; }
+  button:disabled { opacity: .6; cursor: wait; }
+  .err { color: var(--err) !important; }
+  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  #boot-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #boot-bar.indet { width: 30%; animation: indet 1.1s ease-in-out infinite; }
+  @keyframes indet { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  .stat { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .small { font-size: 13px; }
+
+  #pill { position: fixed; z-index: 10; top: calc(8px + env(safe-area-inset-top)); left: calc(8px + env(safe-area-inset-left));
+    display: flex; align-items: center; gap: 0; padding: 6px; border-radius: 999px; font: 600 12px var(--font);
+    background: color-mix(in srgb, var(--card) 85%, transparent); border: 1px solid var(--line); opacity: .55; transition: opacity .2s; }
+  #pill:hover, #pill.open { opacity: 1; }
+  #pill-txt { max-width: 0; overflow: hidden; white-space: nowrap; transition: max-width .3s, margin .3s; }
+  #pill:hover #pill-txt, #pill.open #pill-txt { max-width: 260px; margin: 0 6px 0 7px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  [data-state="ok"] .dot { background: var(--accent); }
+  [data-state="saving"] .dot { background: var(--warn); animation: pulse 1s infinite; }
+  [data-state="pending"] .dot { background: var(--warn); }
+  [data-state="auth"] .dot, [data-state="error"] .dot { background: var(--err); }
+  @keyframes pulse { 50% { opacity: .3; } }
+  @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0"></canvas>
+
+<div id="boot" class="overlay">
+  <div class="card">
+    <h1>Liquid Soccer</h1>
+    <p id="boot-msg">Preparando…</p>
+    <div class="bar"><div id="boot-bar" class="indet"></div></div>
+  </div>
+</div>
+
+<div id="setup" class="overlay" hidden>
+  <form class="card" id="setup-form" autocomplete="off">
+    <h1>Guarda tu progreso en la nube</h1>
+    <p>La partida se copia en un Gist privado de tu GitHub cada vez que el juego guarda, y se recupera al abrir esta página en cualquier navegador.</p>
+    <ol>
+      <li><a id="token-link" target="_blank" rel="noopener" href="https://github.com/settings/tokens/new?scopes=gist&description=Liquid%20Soccer%20guardado">Crea un token clásico</a> con solo el permiso <b>gist</b>. En “Expiration” elige <b>No expiration</b>.</li>
+      <li>Pégalo aquí. Se queda solo en este navegador.</li>
+    </ol>
+    <input id="token" type="password" placeholder="ghp_…" spellcheck="false" aria-label="Token de GitHub">
+    <p id="setup-err" class="err small" hidden></p>
+    <div class="row">
+      <button type="submit" class="primary" id="setup-save">Guardar y jugar</button>
+      <button type="button" id="setup-skip">Jugar sin nube</button>
+    </div>
+  </form>
+</div>
+
+<div id="panel" class="overlay dim" hidden>
+  <div class="card">
+    <h1>Guardado</h1>
+    <div class="stat" id="panel-stat"><span class="dot"></span><span id="panel-txt"></span></div>
+    <p class="small" id="panel-info"></p>
+    <div class="row">
+      <button type="button" class="primary" id="panel-sync">Sincronizar ahora</button>
+      <button type="button" id="panel-token">Cambiar token</button>
+      <button type="button" id="panel-close">Cerrar</button>
+    </div>
+  </div>
+</div>
+
+<button id="pill" type="button" hidden aria-label="Estado del guardado"><span class="dot"></span><span id="pill-txt"></span></button>
+
+<script>
+(() => {
+  'use strict';
+  const GAME = 'https://mageedu23.github.io/g69/class-628/';
+  const SIZES = { [GAME + 'index.wasm']: 13789463, [GAME + 'index.pck']: 13430320 };
+  const GIST_FILE = 'liquid-soccer-save.json';
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- small helpers ----------
+  const LS = {
+    get(k) { try { return localStorage.getItem('sls.' + k); } catch { return null; } },
+    set(k, v) { try { v == null ? localStorage.removeItem('sls.' + k) : localStorage.setItem('sls.' + k, String(v)); } catch {} },
+  };
+  const b64 = (arr) => {
+    const u = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+    let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
+  const unb64 = (s) => { const bin = atob(s); const out = new Int8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) << 24 >> 24; return out; };
+  const fmtTime = (ms) => new Date(ms).toLocaleString([], { hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short' });
+
+  // ---------- Poki SDK stub (the game calls it; ads are not served here) ----------
+  (() => {
+    const ok = () => Promise.resolve();
+    const base = {
+      init: ok, gameLoadingStart() {}, gameLoadingFinished() {}, gameLoadingProgress() {},
+      gameplayStart() {}, gameplayStop() {}, commercialBreak: ok, rewardedBreak: () => Promise.resolve(false),
+      happyTime() {}, setDebug() {}, customEvent() {}, displayAd() {}, destroyAd() {},
+      isAdBlocked: () => false, getURLParam: () => '', shareableURL: () => Promise.resolve(location.href),
+    };
+    window.PokiSDK = new Proxy(base, { get(t, p) { if (p in t) return t[p]; if (p === 'then' || typeof p === 'symbol') return undefined; return ok; } });
+  })();
+  window.addEventListener('keydown', (e) => { if (['ArrowDown', 'ArrowUp', ' '].includes(e.key)) e.preventDefault(); });
+  window.addEventListener('wheel', (e) => e.preventDefault(), { passive: false });
+
+  // ---------- Godot's save store: IndexedDB "/userfs" (Emscripten IDBFS) ----------
+  function openDB() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('/userfs', 21);
+      r.onupgradeneeded = () => {
+        const db = r.result;
+        if (!db.objectStoreNames.contains('FILE_DATA')) db.createObjectStore('FILE_DATA').createIndex('timestamp', 'timestamp', { unique: false });
+      };
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+      r.onblocked = () => rej(new Error('IndexedDB bloqueado'));
+    });
+  }
+  async function readLocal() {
+    const db = await openDB();
+    try {
+      return await new Promise((res, rej) => {
+        const out = {};
+        const tx = db.transaction('FILE_DATA', 'readonly');
+        tx.objectStore('FILE_DATA').openCursor().onsuccess = (e) => {
+          const c = e.target.result; if (!c) return;
+          const v = c.value;
+          out[c.key] = { m: v.mode, t: +new Date(v.timestamp), d: v.contents ? b64(v.contents) : null };
+          c.continue();
+        };
+        tx.oncomplete = () => res(out);
+        tx.onerror = () => rej(tx.error);
+      });
+    } finally { db.close(); }
+  }
+  async function writeLocal(files) {
+    const db = await openDB();
+    try {
+      await new Promise((res, rej) => {
+        const tx = db.transaction('FILE_DATA', 'readwrite');
+        const st = tx.objectStore('FILE_DATA');
+        st.clear();
+        for (const [k, f] of Object.entries(files)) {
+          const v = { timestamp: new Date(f.t), mode: f.m };
+          if (f.d != null) v.contents = unb64(f.d);
+          st.put(v, k);
+        }
+        tx.oncomplete = res;
+        tx.onerror = () => rej(tx.error);
+      });
+    } finally { db.close(); }
+  }
+  async function hashOf(files) {
+    const s = Object.keys(files).sort().map((k) => k + '|' + files[k].m + '|' + (files[k].d ?? '')).join('\n');
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+    return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+  }
+  const isEmpty = (files) => Object.keys(files).length === 0;
+  const maxTs = (files) => Math.max(0, ...Object.values(files).map((f) => f.t || 0));
+
+  // ---------- GitHub Gist as the cloud copy ----------
+  let token = LS.get('token');
+  class AuthError extends Error {}
+  async function gh(path, opts = {}) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const r = await fetch('https://api.github.com' + path, {
+        method: opts.method || 'GET', body: opts.body, keepalive: !!opts.keepalive, cache: 'no-store', signal: ctrl.signal,
+        headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', ...(opts.body ? { 'Content-Type': 'application/json' } : {}) },
+      });
+      if (r.status === 401) throw new AuthError('El token no es válido o ha caducado.');
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error('GitHub respondió ' + r.status);
+      return await r.json();
+    } finally { clearTimeout(timer); }
+  }
+  async function findGist() {
+    const known = LS.get('gist');
+    if (known) return known;
+    for (let page = 1; page <= 10; page++) {
+      const list = await gh(`/gists?per_page=100&page=${page}`);
+      if (!list) break;
+      const g = list.find((x) => x.files && x.files[GIST_FILE]);
+      if (g) { LS.set('gist', g.id); return g.id; }
+      if (list.length < 100) break;
+    }
+    return null;
+  }
+  async function fetchRemote(id) {
+    const g = await gh(`/gists/${id}`);
+    if (!g) { LS.set('gist', null); return null; }
+    const f = g.files[GIST_FILE];
+    if (!f) return null;
+    let text = f.content;
+    if (f.truncated) text = await (await fetch(f.raw_url, { cache: 'no-store' })).text();
+    const data = JSON.parse(text);
+    return data && data.files ? data : null;
+  }
+  async function pushRemote(files, hash, keepalive = false) {
+    const updatedAt = Date.now();
+    const content = JSON.stringify({ v: 1, updatedAt, hash, files });
+    const id = LS.get('gist');
+    if (id) {
+      const ok = await gh(`/gists/${id}`, { method: 'PATCH', keepalive, body: JSON.stringify({ files: { [GIST_FILE]: { content } } }) });
+      if (!ok) { LS.set('gist', null); return pushRemote(files, hash, keepalive); }
+    } else {
+      const g = await gh('/gists', { method: 'POST', body: JSON.stringify({ description: 'Liquid Soccer · guardado automático', public: false, files: { [GIST_FILE]: { content } } }) });
+      LS.set('gist', g.id);
+    }
+    LS.set('hash', hash);
+    LS.set('synced', updatedAt);
+    return updatedAt;
+  }
+
+  // ---------- status UI ----------
+  let state = 'off', authBroken = false, pillTimer;
+  const LABELS = { ok: 'Guardado en la nube', saving: 'Guardando…', pending: 'Sin conexión: se subirá al volver', auth: 'Token no válido', off: 'Nube desactivada', error: 'Error al sincronizar' };
+  function setStatus(kind, detail) {
+    state = kind;
+    const synced = LS.get('synced');
+    const txt = LABELS[kind] + (kind === 'ok' && synced ? ' · ' + fmtTime(+synced) : '');
+    for (const el of [$('pill'), $('panel-stat')]) el.dataset.state = kind;
+    $('pill-txt').textContent = txt;
+    $('panel-txt').textContent = txt;
+    $('panel-info').textContent = detail || (kind === 'off'
+      ? 'El progreso se guarda solo en este navegador.'
+      : 'Se sube solo cada vez que el juego guarda y al cerrar. Al abrir la página se descarga la copia más reciente.');
+    $('pill').hidden = false;
+    if (kind !== 'saving') {
+      $('pill').classList.add('open');
+      clearTimeout(pillTimer);
+      pillTimer = setTimeout(() => $('pill').classList.remove('open'), 3500);
+    }
+  }
+
+  // ---------- reconcile at boot (before the engine mounts the save) ----------
+  async function reconcile() {
+    if (!token) { setStatus('off'); return; }
+    const local = await readLocal();
+    const lh = await hashOf(local);
+    const last = LS.get('hash');
+    const id = await findGist();
+    const remote = id ? await fetchRemote(id) : null;
+    if (!remote) {
+      if (!isEmpty(local)) await pushRemote(local, lh);
+      setStatus('ok');
+      return;
+    }
+    if (remote.hash === lh) { LS.set('hash', lh); LS.set('synced', remote.updatedAt); setStatus('ok'); return; }
+    const localChanged = !isEmpty(local) && lh !== last;   // unsynced local progress (e.g. a crash before upload)
+    const remoteChanged = remote.hash !== last;              // progress from another browser
+    const useRemote = !localChanged ? true : !remoteChanged ? false : remote.updatedAt >= maxTs(local);
+    if (useRemote) {
+      await writeLocal(remote.files);
+      LS.set('hash', remote.hash);
+      LS.set('synced', remote.updatedAt);
+    } else {
+      await pushRemote(local, lh);
+    }
+    setStatus('ok');
+  }
+
+  // ---------- continuous sync while playing ----------
+  let busy = false;
+  async function tick(keepalive = false) {
+    if (!token || authBroken || busy) return;
+    busy = true;
+    try {
+      const local = await readLocal();
+      if (isEmpty(local)) return;
+      const h = await hashOf(local);
+      if (h === LS.get('hash')) { if (state !== 'ok') setStatus('ok'); return; }
+      setStatus('saving');
+      await pushRemote(local, h, keepalive);
+      setStatus('ok');
+    } catch (e) {
+      if (e instanceof AuthError) { authBroken = true; setStatus('auth', e.message + ' Pulsa “Cambiar token”. Mientras tanto se guarda en este navegador.'); }
+      else setStatus('pending');
+    } finally { busy = false; }
+  }
+
+  // ---------- engine ----------
+  function bootMsg(text, pct) {
+    $('boot-msg').textContent = text;
+    const bar = $('boot-bar');
+    if (pct == null) { bar.classList.add('indet'); bar.style.width = ''; }
+    else { bar.classList.remove('indet'); bar.style.width = Math.round(pct * 100) + '%'; }
+  }
+  function fail(msg) { bootMsg(String(msg && msg.message || msg)); $('boot-bar').classList.remove('indet'); $('boot').hidden = false; }
+  function startEngine() {
+    bootMsg('Cargando el juego…');
+    const s = document.createElement('script');
+    s.src = GAME + 'index.js';
+    s.onerror = () => fail('No se pudo descargar el juego. Comprueba tu conexión y recarga.');
+    s.onload = () => {
+      if (!window.Engine) return fail('El juego no respondió. Recarga la página.');
+      if (!Engine.isWebGLAvailable()) return fail('Tu navegador no tiene WebGL activado.');
+      const engine = new Engine({
+        args: [], canvasResizePolicy: 2, executable: GAME + 'index', experimentalVK: false, fileSizes: SIZES,
+        focusCanvas: true, gdnativeLibs: [], serviceWorker: '', canvas: $('canvas'),
+        onProgress: (cur, total) => bootMsg('Cargando el juego…', total > 0 ? Math.min(1, cur / total) : null),
+      });
+      Promise.all([engine.init(GAME + 'index'), engine.preloadFile(GAME + 'index.pck', 'index.pck')])
+        .then(() => { bootMsg('Arrancando…'); return engine.start({ args: ['--main-pack', 'index.pck'] }); })
+        .then(() => { $('boot').hidden = true; $('canvas').focus(); }, fail);
+    };
+    document.head.appendChild(s);
+  }
+
+  // ---------- setup / panel ----------
+  function askToken(allowSkip = true) {
+    return new Promise((resolve) => {
+      $('setup').hidden = false;
+      $('setup-skip').hidden = !allowSkip;
+      $('token').value = '';
+      $('token').focus();
+      $('setup-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const t = $('token').value.trim();
+        if (!t) { showErr('Pega el token para continuar.'); return; }
+        $('setup-save').disabled = true;
+        const prev = token; token = t;
+        try {
+          await gh('/gists?per_page=1');
+          LS.set('token', t); LS.set('skip', null); LS.set('gist', null); LS.set('hash', null);
+          $('setup').hidden = true;
+          resolve(true);
+        } catch (err) {
+          token = prev;
+          showErr(err instanceof AuthError ? 'GitHub rechazó ese token. Revisa que tenga el permiso gist.' : 'No se pudo contactar con GitHub. Comprueba tu conexión.');
+        } finally { $('setup-save').disabled = false; }
+      };
+      $('setup-skip').onclick = () => { LS.set('skip', 1); $('setup').hidden = true; resolve(false); };
+    });
+  }
+  function showErr(m) { $('setup-err').textContent = m; $('setup-err').hidden = false; }
+
+  $('pill').onclick = () => { $('panel').hidden = false; $('panel-sync').hidden = !token; };
+  $('panel-close').onclick = () => { $('panel').hidden = true; $('canvas').focus(); };
+  $('panel-sync').onclick = async () => { authBroken = false; await tick(); };
+  $('panel-token').onclick = async () => {
+    $('panel').hidden = true;
+    const changed = await askToken(true);
+    if (changed) location.reload(); // re-run the boot merge against the new account
+    else $('canvas').focus();
+  };
+  $('setup').addEventListener('keydown', (e) => e.stopPropagation());
+
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') tick(true); });
+  window.addEventListener('pagehide', () => tick(true));
+  window.addEventListener('online', () => tick());
+
+  // ---------- go ----------
+  (async () => {
+    if (!token && !LS.get('skip')) { $('boot').hidden = true; await askToken(true); $('boot').hidden = false; token = LS.get('token'); }
+    bootMsg(token ? 'Recuperando tu partida…' : 'Preparando…');
+    try { await reconcile(); }
+    catch (e) {
+      if (e instanceof AuthError) { authBroken = true; setStatus('auth', e.message + ' Pulsa “Cambiar token”.'); }
+      else setStatus('pending', 'No se pudo leer la nube. Juegas con el guardado de este navegador y se subirá al recuperar conexión.');
+    }
+    startEngine();
+    setInterval(tick, 2000);
+  })();
+})();
+</script>
+</body>
+</html>
