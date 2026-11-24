@@ -395,6 +395,23 @@
     else { bar.classList.remove('indet'); bar.style.width = Math.round(pct * 100) + '%'; }
   }
   function fail(msg) { bootMsg(String(msg && msg.message || msg)); $('boot-bar').classList.remove('indet'); $('boot').hidden = false; }
+  // GPU reset: Godot 3 only shows an alert and stays broken; reload straight back into the game instead.
+  function recoverGPU() {
+    if (recoverGPU.busy) return;
+    recoverGPU.busy = true;
+    let hits = [];
+    try { hits = JSON.parse(sessionStorage.getItem('sls.gpuLost') || '[]'); } catch {}
+    hits = hits.filter((t) => Date.now() - t < 60000).concat(Date.now());
+    try { sessionStorage.setItem('sls.gpuLost', JSON.stringify(hits)); } catch {}
+    if (hits.length > 3) return fail('La gráfica se ha reiniciado varias veces seguidas. Cierra otras pestañas y recarga.');
+    bootMsg('Recuperando el juego…');
+    $('boot').hidden = false;
+    setTimeout(() => location.reload(), 300);
+  }
+  const nativeAlert = window.alert.bind(window);
+  window.alert = (m) => { if (/webgl context lost/i.test(String(m))) recoverGPU(); else nativeAlert(m); };
+  $('canvas').addEventListener('webglcontextlost', recoverGPU);
+
   function startEngine() {
     bootMsg('Cargando el juego…');
     const s = document.createElement('script');
