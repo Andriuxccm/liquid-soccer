@@ -60,7 +60,7 @@
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
   [data-state="ok"] .dot { background: var(--accent); }
   [data-state="saving"] .dot { background: var(--warn); animation: pulse 1s infinite; }
-  [data-state="pending"] .dot { background: var(--warn); }
+  [data-state="pending"] .dot, [data-state="stale"] .dot { background: var(--warn); }
   [data-state="auth"] .dot, [data-state="error"] .dot { background: var(--err); }
   @keyframes pulse { 50% { opacity: .3; } }
   @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
@@ -103,6 +103,18 @@
       <button type="button" class="primary" id="panel-sync">Sincronizar ahora</button>
       <button type="button" id="panel-token">Cambiar token</button>
       <button type="button" id="panel-close">Cerrar</button>
+    </div>
+  </div>
+</div>
+
+<div id="choice" class="overlay dim" hidden>
+  <div class="card">
+    <h1>Hay una partida más reciente</h1>
+    <p id="choice-info"></p>
+    <div class="row">
+      <button type="button" class="primary" id="choice-remote">Cargar la de la nube</button>
+      <button type="button" id="choice-local">Quedarme con la de este navegador</button>
+      <button type="button" id="choice-later">Ahora no</button>
     </div>
   </div>
 </div>
@@ -197,11 +209,11 @@
     return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
   }
   const isEmpty = (files) => Object.keys(files).length === 0;
-  const maxTs = (files) => Math.max(0, ...Object.values(files).map((f) => f.t || 0));
 
   // ---------- GitHub Gist as the cloud copy ----------
   let token = LS.get('token');
   class AuthError extends Error {}
+  let lastScopes = null;
   async function gh(path, opts = {}) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 12000);
@@ -210,6 +222,7 @@
         method: opts.method || 'GET', body: opts.body, keepalive: !!opts.keepalive, cache: 'no-store', signal: ctrl.signal,
         headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', ...(opts.body ? { 'Content-Type': 'application/json' } : {}) },
       });
+      lastScopes = r.headers.get('x-oauth-scopes');
       if (r.status === 401) throw new AuthError('El token no es válido o ha caducado.');
       if (r.status === 404) return null;
       if (!r.ok) throw new Error('GitHub respondió ' + r.status);
@@ -247,16 +260,41 @@
       if (!ok) { LS.set('gist', null); return pushRemote(files, hash, keepalive); }
     } else {
       const g = await gh('/gists', { method: 'POST', body: JSON.stringify({ description: 'Liquid Soccer · guardado automático', public: false, files: { [GIST_FILE]: { content } } }) });
+      if (!g || !g.id) throw new AuthError('El token no tiene permiso para crear gists.');
       LS.set('gist', g.id);
     }
     LS.set('hash', hash);
     LS.set('synced', updatedAt);
+    LS.set('pendingHash', null);
     return updatedAt;
+  }
+  function adoptRemote(remote) {
+    LS.set('hash', remote.hash);
+    LS.set('synced', remote.updatedAt);
+    LS.set('pendingHash', null);
+    return writeLocal(remote.files);
+  }
+
+  // ---------- conflict prompt ----------
+  function askConflict(remote, localChanged, booting) {
+    return new Promise((resolve) => {
+      const changedAt = +LS.get('changedAt') || Date.now();
+      $('choice-info').textContent = localChanged
+        ? `La nube tiene una partida del ${fmtTime(remote.updatedAt)} hecha en otro navegador, y este navegador tiene progreso sin subir del ${fmtTime(changedAt)}. Elige cuál conservar: la otra se pierde.`
+        : `Otro navegador guardó progreso el ${fmtTime(remote.updatedAt)}. Cárgalo para seguir desde ahí. Hasta entonces no se sube nada desde aquí, para no pisarlo.`;
+      $('choice-local').hidden = !localChanged;
+      $('choice-later').hidden = booting;
+      $('choice').hidden = false;
+      const done = (v) => { $('choice').hidden = true; resolve(v); };
+      $('choice-remote').onclick = () => done('remote');
+      $('choice-local').onclick = () => done('local');
+      $('choice-later').onclick = () => done('later');
+    });
   }
 
   // ---------- status UI ----------
   let state = 'off', authBroken = false, pillTimer;
-  const LABELS = { ok: 'Guardado en la nube', saving: 'Guardando…', pending: 'Sin conexión: se subirá al volver', auth: 'Token no válido', off: 'Nube desactivada', error: 'Error al sincronizar' };
+  const LABELS = { ok: 'Guardado en la nube', saving: 'Guardando…', stale: 'Hay una partida más reciente en la nube', pending: 'Sin conexión: se subirá al volver', auth: 'Token no válido', off: 'Nube desactivada', error: 'Error al sincronizar' };
   function setStatus(kind, detail) {
     state = kind;
     const synced = LS.get('synced');
@@ -289,36 +327,56 @@
       return;
     }
     if (remote.hash === lh) { LS.set('hash', lh); LS.set('synced', remote.updatedAt); setStatus('ok'); return; }
-    const localChanged = !isEmpty(local) && lh !== last;   // unsynced local progress (e.g. a crash before upload)
-    const remoteChanged = remote.hash !== last;              // progress from another browser
-    const useRemote = !localChanged ? true : !remoteChanged ? false : remote.updatedAt >= maxTs(local);
-    if (useRemote) {
-      await writeLocal(remote.files);
-      LS.set('hash', remote.hash);
-      LS.set('synced', remote.updatedAt);
-    } else {
-      await pushRemote(local, lh);
-    }
+    // A browser that never synced (last == null) always takes the cloud copy.
+    const localChanged = !isEmpty(local) && last != null && lh !== last; // unsynced progress here (e.g. a crash before upload)
+    const remoteChanged = remote.hash !== last;                          // progress from another browser
+    let useRemote = !localChanged;
+    if (localChanged && remoteChanged) { $('boot').hidden = true; useRemote = (await askConflict(remote, true, true)) === 'remote'; $('boot').hidden = false; }
+    if (useRemote) await adoptRemote(remote);
+    else await pushRemote(local, lh);
     setStatus('ok');
   }
 
   // ---------- continuous sync while playing ----------
-  let busy = false;
+  let busy = false, staleRemote = null;
+  async function resolveStale() {
+    const local = await readLocal();
+    const h = await hashOf(local);
+    const pick = await askConflict(staleRemote, h !== LS.get('hash'), false);
+    if (pick === 'remote') { await adoptRemote(staleRemote); location.reload(); }
+    else if (pick === 'local') { busy = true; try { await pushRemote(await readLocal(), await hashOf(await readLocal())); staleRemote = null; setStatus('ok'); } catch { setStatus('pending'); } finally { busy = false; } }
+  }
+  function markStale(remote) { staleRemote = remote; setStatus('stale'); resolveStale(); }
   async function tick(keepalive = false) {
-    if (!token || authBroken || busy) return;
+    if (!token || authBroken || busy || staleRemote) return;
     busy = true;
     try {
       const local = await readLocal();
       if (isEmpty(local)) return;
       const h = await hashOf(local);
-      if (h === LS.get('hash')) { if (state !== 'ok') setStatus('ok'); return; }
+      const last = LS.get('hash');
+      if (h === last) { if (state !== 'ok') setStatus('ok'); return; }
+      if (LS.get('pendingHash') !== h) { LS.set('pendingHash', h); LS.set('changedAt', Date.now()); }
       setStatus('saving');
+      // Never overwrite progress another browser uploaded since this one last synced.
+      const id = LS.get('gist');
+      const remote = id ? await fetchRemote(id) : null;
+      if (remote && remote.hash !== last && remote.hash !== h) { markStale(remote); return; }
       await pushRemote(local, h, keepalive);
       setStatus('ok');
     } catch (e) {
       if (e instanceof AuthError) { authBroken = true; setStatus('auth', e.message + ' Pulsa “Cambiar token”. Mientras tanto se guarda en este navegador.'); }
       else setStatus('pending');
     } finally { busy = false; }
+  }
+  async function checkRemote() {
+    const id = LS.get('gist');
+    if (!token || authBroken || busy || staleRemote || !id) return;
+    busy = true;
+    try {
+      const remote = await fetchRemote(id);
+      if (remote && remote.hash !== LS.get('hash')) { busy = false; markStale(remote); }
+    } catch {} finally { busy = false; }
   }
 
   // ---------- engine ----------
@@ -364,6 +422,8 @@
         const prev = token; token = t;
         try {
           await gh('/gists?per_page=1');
+          const scopes = (lastScopes || '').split(',').map((s) => s.trim());
+          if (!scopes.includes('gist')) { token = prev; showErr('A ese token le falta el permiso gist. Crea un token clásico marcando solo “gist”.'); return; }
           LS.set('token', t); LS.set('skip', null); LS.set('gist', null); LS.set('hash', null);
           $('setup').hidden = true;
           resolve(true);
@@ -377,7 +437,7 @@
   }
   function showErr(m) { $('setup-err').textContent = m; $('setup-err').hidden = false; }
 
-  $('pill').onclick = () => { $('panel').hidden = false; $('panel-sync').hidden = !token; };
+  $('pill').onclick = () => { if (staleRemote) { resolveStale(); return; } $('panel').hidden = false; $('panel-sync').hidden = !token; };
   $('panel-close').onclick = () => { $('panel').hidden = true; $('canvas').focus(); };
   $('panel-sync').onclick = async () => { authBroken = false; await tick(); };
   $('panel-token').onclick = async () => {
@@ -388,7 +448,8 @@
   };
   $('setup').addEventListener('keydown', (e) => e.stopPropagation());
 
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') tick(true); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') tick(true); else checkRemote(); });
+  window.addEventListener('focus', () => checkRemote());
   window.addEventListener('pagehide', () => tick(true));
   window.addEventListener('online', () => tick());
 
