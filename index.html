@@ -266,9 +266,11 @@
     LS.set('hash', hash);
     LS.set('synced', updatedAt);
     LS.set('pendingHash', null);
+    remoteSeenAt = Date.now();
     return updatedAt;
   }
   function adoptRemote(remote) {
+    remoteSeenAt = Date.now();
     LS.set('hash', remote.hash);
     LS.set('synced', remote.updatedAt);
     LS.set('pendingHash', null);
@@ -326,7 +328,7 @@
       setStatus('ok');
       return;
     }
-    if (remote.hash === lh) { LS.set('hash', lh); LS.set('synced', remote.updatedAt); setStatus('ok'); return; }
+    if (remote.hash === lh) { remoteSeenAt = Date.now(); LS.set('hash', lh); LS.set('synced', remote.updatedAt); setStatus('ok'); return; }
     // A browser that never synced (last == null) always takes the cloud copy.
     const localChanged = !isEmpty(local) && last != null && lh !== last; // unsynced progress here (e.g. a crash before upload)
     const remoteChanged = remote.hash !== last;                          // progress from another browser
@@ -338,7 +340,7 @@
   }
 
   // ---------- continuous sync while playing ----------
-  let busy = false, staleRemote = null;
+  let busy = false, staleRemote = null, remoteSeenAt = 0;
   async function resolveStale() {
     const local = await readLocal();
     const h = await hashOf(local);
@@ -347,7 +349,10 @@
     else if (pick === 'local') { busy = true; try { await pushRemote(await readLocal(), await hashOf(await readLocal())); staleRemote = null; setStatus('ok'); } catch { setStatus('pending'); } finally { busy = false; } }
   }
   function markStale(remote) { staleRemote = remote; setStatus('stale'); resolveStale(); }
-  async function tick(keepalive = false) {
+  // leaving = tab is being hidden/closed: upload at once with keepalive, skipping the
+  // pre-check when the cloud copy was confirmed unchanged in the last minute.
+  async function tick(leaving = false) {
+    const keepalive = leaving;
     if (!token || authBroken || busy || staleRemote) return;
     busy = true;
     try {
@@ -360,8 +365,10 @@
       setStatus('saving');
       // Never overwrite progress another browser uploaded since this one last synced.
       const id = LS.get('gist');
-      const remote = id ? await fetchRemote(id) : null;
-      if (remote && remote.hash !== last && remote.hash !== h) { markStale(remote); return; }
+      if (!(leaving && Date.now() - remoteSeenAt < 60000)) {
+        const remote = id ? await fetchRemote(id) : null;
+        if (remote && remote.hash !== last && remote.hash !== h) { markStale(remote); return; }
+      }
       await pushRemote(local, h, keepalive);
       setStatus('ok');
     } catch (e) {
@@ -376,6 +383,7 @@
     try {
       const remote = await fetchRemote(id);
       if (remote && remote.hash !== LS.get('hash')) { busy = false; markStale(remote); }
+      else if (remote) remoteSeenAt = Date.now();
     } catch {} finally { busy = false; }
   }
 
@@ -464,6 +472,7 @@
     }
     startEngine();
     setInterval(tick, 2000);
+    setInterval(() => { if (document.visibilityState === 'visible') checkRemote(); }, 30000);
   })();
 })();
 </script>
