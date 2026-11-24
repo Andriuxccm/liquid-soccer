@@ -58,7 +58,7 @@
   #pill-txt { max-width: 0; overflow: hidden; white-space: nowrap; transition: max-width .3s, margin .3s; }
   #pill:hover #pill-txt, #pill.open #pill-txt { max-width: 260px; margin: 0 6px 0 7px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
-  [data-state="ok"] .dot { background: var(--accent); }
+  [data-state="ok"] .dot, [data-state="off"] .dot { background: var(--accent); }
   [data-state="saving"] .dot { background: var(--warn); animation: pulse 1s infinite; }
   [data-state="pending"] .dot, [data-state="stale"] .dot { background: var(--warn); }
   [data-state="auth"] .dot, [data-state="error"] .dot { background: var(--err); }
@@ -79,8 +79,8 @@
 
 <div id="setup" class="overlay" hidden>
   <form class="card" id="setup-form" autocomplete="off">
-    <h1>Guarda tu progreso en la nube</h1>
-    <p>La partida se copia en un Gist privado de tu GitHub cada vez que el juego guarda, y se recupera al abrir esta página en cualquier navegador.</p>
+    <h1>Sincronizar entre navegadores (opcional)</h1>
+    <p>Tu partida ya se guarda sola en este navegador. Esto solo hace falta si quieres seguirla en otro navegador u ordenador: se copia en un Gist privado de tu GitHub.</p>
     <ol>
       <li><a id="token-link" target="_blank" rel="noopener" href="https://github.com/settings/tokens/new?scopes=gist&description=Liquid%20Soccer%20guardado">Crea un token clásico</a> con solo el permiso <b>gist</b>. En “Expiration” elige <b>No expiration</b>.</li>
       <li>Pégalo aquí. Se queda solo en este navegador.</li>
@@ -88,8 +88,8 @@
     <input id="token" type="password" placeholder="ghp_…" spellcheck="false" aria-label="Token de GitHub">
     <p id="setup-err" class="err small" hidden></p>
     <div class="row">
-      <button type="submit" class="primary" id="setup-save">Guardar y jugar</button>
-      <button type="button" id="setup-skip">Jugar sin nube</button>
+      <button type="submit" class="primary" id="setup-save">Activar</button>
+      <button type="button" id="setup-skip">Cancelar</button>
     </div>
   </form>
 </div>
@@ -296,7 +296,7 @@
 
   // ---------- status UI ----------
   let state = 'off', authBroken = false, pillTimer;
-  const LABELS = { ok: 'Guardado en la nube', saving: 'Guardando…', stale: 'Hay una partida más reciente en la nube', pending: 'Sin conexión: se subirá al volver', auth: 'Token no válido', off: 'Nube desactivada', error: 'Error al sincronizar' };
+  const LABELS = { ok: 'Guardado en la nube', saving: 'Guardando…', stale: 'Hay una partida más reciente en la nube', pending: 'Sin conexión: se subirá al volver', auth: 'Token no válido', off: 'Partida guardada en este navegador', error: 'Error al sincronizar' };
   function setStatus(kind, detail) {
     state = kind;
     const synced = LS.get('synced');
@@ -305,7 +305,7 @@
     $('pill-txt').textContent = txt;
     $('panel-txt').textContent = txt;
     $('panel-info').textContent = detail || (kind === 'off'
-      ? 'El progreso se guarda solo en este navegador.'
+      ? 'Se guarda sola tras cada partido y se mantiene aunque cierres la página o se cuelgue. Para seguirla en otro navegador, activa la sincronización.'
       : 'Se sube solo cada vez que el juego guarda y al cerrar. Al abrir la página se descarga la copia más reciente.');
     $('pill').hidden = false;
     if (kind !== 'saving') {
@@ -445,7 +445,7 @@
   }
   function showErr(m) { $('setup-err').textContent = m; $('setup-err').hidden = false; }
 
-  $('pill').onclick = () => { if (staleRemote) { resolveStale(); return; } $('panel').hidden = false; $('panel-sync').hidden = !token; };
+  $('pill').onclick = () => { if (staleRemote) { resolveStale(); return; } $('panel').hidden = false; $('panel-sync').hidden = !token; $('panel-token').textContent = token ? 'Cambiar token' : 'Sincronizar entre navegadores'; };
   $('panel-close').onclick = () => { $('panel').hidden = true; $('canvas').focus(); };
   $('panel-sync').onclick = async () => { authBroken = false; await tick(); };
   $('panel-token').onclick = async () => {
@@ -463,7 +463,8 @@
 
   // ---------- go ----------
   (async () => {
-    if (!token && !LS.get('skip')) { $('boot').hidden = true; await askToken(true); $('boot').hidden = false; token = LS.get('token'); }
+    // Ask the browser not to evict the save under storage pressure.
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
     bootMsg(token ? 'Recuperando tu partida…' : 'Preparando…');
     try { await reconcile(); }
     catch (e) {
