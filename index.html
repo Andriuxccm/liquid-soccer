@@ -125,7 +125,7 @@
 (() => {
   'use strict';
   const GAME = 'https://mageedu23.github.io/g69/class-628/';
-  const SIZES = { [GAME + 'index.wasm']: 13789463, [GAME + 'index.pck']: 13430320 };
+  const SIZES = { [GAME + 'index.wasm']: 13789463, [GAME + 'index.pck']: 14088880 };
   const GIST_FILE = 'liquid-soccer-save.json';
   const $ = (id) => document.getElementById(id);
 
@@ -394,7 +394,8 @@
     if (pct == null) { bar.classList.add('indet'); bar.style.width = ''; }
     else { bar.classList.remove('indet'); bar.style.width = Math.round(pct * 100) + '%'; }
   }
-  function fail(msg) { bootMsg(String(msg && msg.message || msg)); $('boot-bar').classList.remove('indet'); $('boot').hidden = false; }
+  let bootDone = false; // stop late download-progress events from overwriting later messages
+  function fail(msg) { bootDone = true; bootMsg(String(msg && msg.message || msg)); $('boot-bar').classList.remove('indet'); $('boot').hidden = false; }
   // GPU reset: Godot 3 only shows an alert and stays broken; reload straight back into the game instead.
   function recoverGPU() {
     if (recoverGPU.busy) return;
@@ -412,6 +413,78 @@
   window.alert = (m) => { if (/webgl context lost/i.test(String(m))) recoverGPU(); else nativeAlert(m); };
   $('canvas').addEventListener('webglcontextlost', recoverGPU);
 
+  // The game only writes tournament saves when "Save" is pressed. Patch the three tournament
+  // viewer scripts so their _ready() starts with `Global.tournament._saveState()`, i.e. it saves
+  // every time you land on the bracket/table (after each match, on start and on continue).
+  const PCK_PATCHES = [
+    { path: 'res://Scenes/CupViewer.gdc', size: 7451, pos: 3293, ins: 'd9010000811c000054811d000054814900005051', tok: 26, linesOff: 1468, nl: 223 },
+    { path: 'res://Scenes/LeagueViewer.gdc', size: 5060, pos: 2490, ins: 'd901000081050000548106000054814200005051', tok: 30, linesOff: 1264, nl: 148 },
+    { path: 'res://Scenes/WCViewer.gdc', size: 3505, pos: 2159, ins: 'd9010000810e000054810f000054813f00005051', tok: 48, linesOff: 1240, nl: 104 },
+  ];
+  const NTOK = 8; // tokens inserted: NEWLINE Global . tournament . _saveState ( )
+  function patchPck(buf) {
+    const u8 = new Uint8Array(buf), dv = new DataView(buf);
+    if (dv.getUint32(0, true) !== 0x43504447) return buf; // 'GDPC'
+    let o = 4 + 16 + 64;
+    const count = dv.getUint32(o, true); o += 4;
+    const td = new TextDecoder(), entries = {};
+    for (let i = 0; i < count; i++) {
+      const len = dv.getUint32(o, true); o += 4;
+      entries[td.decode(u8.subarray(o, o + len)).replace(/\0+$/, '')] = o + len;
+      o += len + 32; // offset u64, size u64, md5[16]
+    }
+    const files = [];
+    for (const P of PCK_PATCHES) {
+      const e = entries[P.path];
+      if (e == null) continue;
+      const off = Number(dv.getBigUint64(e, true)), size = Number(dv.getBigUint64(e + 8, true));
+      const ins = Uint8Array.from(P.ins.match(/../g), (h) => parseInt(h, 16));
+      // Only patch the exact build this was made for.
+      if (size !== P.size || dv.getUint32(off, true) !== 0x43534447 || !ins.slice(0, 4).every((b, i) => u8[off + P.pos + i] === b)) continue;
+      const nb = new Uint8Array(size + ins.length), nd = new DataView(nb.buffer);
+      nb.set(u8.subarray(off, off + P.pos));
+      nb.set(ins, P.pos);
+      nb.set(u8.subarray(off + P.pos, off + size), P.pos + ins.length);
+      nd.setUint32(20, nd.getUint32(20, true) + NTOK, true); // token count
+      for (let j = 0; j < P.nl; j++) { // keep the token->line table aligned
+        const q = P.linesOff + 8 * j, k = nd.getUint32(q, true);
+        if (k >= P.tok) nd.setUint32(q, k + NTOK, true);
+      }
+      files.push({ e, nb });
+    }
+    if (!files.length) return buf;
+    const out = new Uint8Array(buf.byteLength + files.reduce((s, f) => s + f.nb.length, 0));
+    const odv = new DataView(out.buffer);
+    out.set(u8);
+    let at = buf.byteLength;
+    for (const f of files) { // append patched files and repoint their index entries
+      out.set(f.nb, at);
+      odv.setBigUint64(f.e, BigInt(at), true);
+      odv.setBigUint64(f.e + 8, BigInt(f.nb.length), true);
+      at += f.nb.length;
+    }
+    return out.buffer;
+  }
+  async function loadPck(onBytes) {
+    const r = await fetch(GAME + 'index.pck');
+    if (!r.ok) throw new Error('No se pudo descargar el juego. Comprueba tu conexión y recarga.');
+    let buf;
+    if (r.body && r.body.getReader) {
+      const reader = r.body.getReader(), chunks = [];
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value); got += value.length; onBytes(got);
+      }
+      const all = new Uint8Array(got);
+      let o = 0;
+      for (const c of chunks) { all.set(c, o); o += c.length; }
+      buf = all.buffer;
+    } else buf = await r.arrayBuffer();
+    try { return patchPck(buf); } catch (e) { console.warn('pck patch skipped', e); return buf; }
+  }
+
   function startEngine() {
     bootMsg('Cargando el juego…');
     const s = document.createElement('script');
@@ -423,10 +496,17 @@
       const engine = new Engine({
         args: [], canvasResizePolicy: 2, executable: GAME + 'index', experimentalVK: false, fileSizes: SIZES,
         focusCanvas: true, gdnativeLibs: [], serviceWorker: '', canvas: $('canvas'),
-        onProgress: (cur, total) => bootMsg('Cargando el juego…', total > 0 ? Math.min(1, cur / total) : null),
+        onProgress: (cur, total) => { wasm = [cur, total]; progress(); },
       });
-      Promise.all([engine.init(GAME + 'index'), engine.preloadFile(GAME + 'index.pck', 'index.pck')])
-        .then(() => { bootMsg('Arrancando…'); return engine.start({ args: ['--main-pack', 'index.pck'] }); })
+      let wasm = [0, 0], pck = 0;
+      const pckTotal = SIZES[GAME + 'index.pck'];
+      const progress = () => {
+        if (bootDone) return;
+        const t = wasm[1] + pckTotal;
+        bootMsg('Cargando el juego…', wasm[1] > 0 ? Math.min(1, (wasm[0] + Math.min(pck, pckTotal)) / t) : null);
+      };
+      Promise.all([engine.init(GAME + 'index'), loadPck((n) => { pck = n; progress(); }).then((b) => engine.preloadFile(b, 'index.pck'))])
+        .then(() => { bootDone = true; bootMsg('Arrancando…'); return engine.start({ args: ['--main-pack', 'index.pck'] }); })
         .then(() => { $('boot').hidden = true; $('canvas').focus(); }, fail);
     };
     document.head.appendChild(s);
